@@ -133,48 +133,95 @@ def load_greeks(path: Path) -> pd.DataFrame:
 def load_hv(hv_root: Path, segment: str, symbol: str) -> pd.DataFrame:
     hv_symbol = hv_symbol_for(segment, symbol)
     hv_file = hv_root / segment / f"{hv_symbol}.csv"
+
     if not hv_file.exists():
         raise FileNotFoundError(f"HV file not found: {hv_file}")
 
     hv = pd.read_csv(hv_file, low_memory=False)
     hv.columns = hv.columns.astype(str).str.strip().str.upper()
 
-    keep_cols = ["TRADE_DATE", "CLOSE", "HV_10", "HV_20", "HV_30", "HV_60", "HV_90", "HV_252"]
-    keep_cols = [col for col in keep_cols if col in hv.columns]
+    # Keep only required columns
+    keep_cols = [
+        "TRADE_DATE",
+        "CLOSE",
+        "HV_10",
+        "HV_20",
+        "HV_30",
+        "HV_60",
+        "HV_90",
+        "HV_252",
+    ]
+    keep_cols = [c for c in keep_cols if c in hv.columns]
+
     hv = hv[keep_cols].copy()
-    hv = hv.rename(columns={"CLOSE": "UNDERLYING_CLOSE"})
 
-    for col in keep_cols:
-        if col != "SYMBOL":
-            hv[col if col != "CLOSE" else "UNDERLYING_CLOSE"] = pd.to_numeric(
-                hv[col if col != "CLOSE" else "UNDERLYING_CLOSE"],
-                errors="coerce",
-            )
+    # Rename CLOSE to UNDERLYING_CLOSE
+    hv.rename(columns={"CLOSE": "UNDERLYING_CLOSE"}, inplace=True)
 
-    return hv.drop_duplicates("TRADE_DATE", keep="last")
+    # Convert numeric columns
+    numeric_cols = [
+        "UNDERLYING_CLOSE",
+        "HV_10",
+        "HV_20",
+        "HV_30",
+        "HV_60",
+        "HV_90",
+        "HV_252",
+    ]
+
+    for col in numeric_cols:
+        if col in hv.columns:
+            hv[col] = pd.to_numeric(hv[col], errors="coerce")
+
+    # Remove duplicate trade dates
+    hv = hv.drop_duplicates(subset="TRADE_DATE", keep="last")
+
+    return hv
 
 
 def add_row_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["MONEYNESS"] = out["STRIKE_PRICE"] / out["SPOT_CLOSE"]
+
+    # Prevent divide-by-zero
+    out["MONEYNESS"] = out["STRIKE_PRICE"] / out["SPOT_CLOSE"].replace(0, np.nan)
+
     out["MONEYNESS_PCT"] = (out["MONEYNESS"] - 1.0) * 100.0
     out["ABS_MONEYNESS_PCT"] = out["MONEYNESS_PCT"].abs()
 
-    for hv_col in ["HV_10", "HV_20", "HV_30", "HV_60", "HV_90", "HV_252"]:
+    hv_columns = [
+        "HV_10",
+        "HV_20",
+        "HV_30",
+        "HV_60",
+        "HV_90",
+        "HV_252",
+    ]
+
+    for hv_col in hv_columns:
         if hv_col not in out.columns:
             continue
+
         suffix = hv_col.replace("HV_", "")
+
+        # IV - HV
         out[f"IV_MINUS_HV_{suffix}"] = out["IMPLIED_VOL"] - out[hv_col]
-        out[f"IV_HV_RATIO_{suffix}"] = out["IMPLIED_VOL"] / out[hv_col].replace(0, np.nan)
+
+        # IV / HV
+        out[f"IV_HV_RATIO_{suffix}"] = (
+            out["IMPLIED_VOL"] /
+            out[hv_col].replace(0, np.nan)
+        )
 
     return out
 
 
 def build_daily_summary(option_rows: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
     valid = option_rows.dropna(subset=["IMPLIED_VOL", "TRADE_DATE"]).copy()
+
     if valid.empty:
         return pd.DataFrame()
 
+    # Prefer ATM options (±3% moneyness)
     atm = valid[valid["ABS_MONEYNESS_PCT"] <= 3.0].copy()
     source = atm if not atm.empty else valid
 
@@ -182,8 +229,14 @@ def build_daily_summary(option_rows: pd.DataFrame, windows: list[int]) -> pd.Dat
         source.groupby(["TRADE_DATE", "SYMBOL"], as_index=False)
         .agg(
             ATM_IV=("IMPLIED_VOL", "median"),
-            ATM_IV_CE=("IMPLIED_VOL", lambda s: s[source.loc[s.index, "OPT_TYPE"].eq("CE")].median()),
-            ATM_IV_PE=("IMPLIED_VOL", lambda s: s[source.loc[s.index, "OPT_TYPE"].eq("PE")].median()),
+            ATM_IV_CE=(
+                "IMPLIED_VOL",
+                lambda s: s[source.loc[s.index, "OPT_TYPE"].eq("CE")].median(),
+            ),
+            ATM_IV_PE=(
+                "IMPLIED_VOL",
+                lambda s: s[source.loc[s.index, "OPT_TYPE"].eq("PE")].median(),
+            ),
             MEDIAN_DELTA=("DELTA", "median"),
             MEDIAN_THETA=("THETA", "median"),
             MEDIAN_VEGA=("VEGA", "median"),
@@ -199,27 +252,101 @@ def build_daily_summary(option_rows: pd.DataFrame, windows: list[int]) -> pd.Dat
         .sort_values("TRADE_DATE")
     )
 
-    hv_cols = ["UNDERLYING_CLOSE", "HV_10", "HV_20", "HV_30", "HV_60", "HV_90", "HV_252"]
-    hv_daily = option_rows[["TRADE_DATE", *[c for c in hv_cols if c in option_rows.columns]]].drop_duplicates("TRADE_DATE")
-    daily = daily.merge(hv_daily, on="TRADE_DATE", how="left")
+    # --------------------------------------------------
+    # Merge Historical Volatility
+    # --------------------------------------------------
 
-    daily["IV_MINUS_HV_20"] = daily["ATM_IV"] - daily.get("HV_20")
-    daily["IV_MINUS_HV_30"] = daily["ATM_IV"] - daily.get("HV_30")
-    daily["IV_HV_RATIO_20"] = daily["ATM_IV"] / daily.get("HV_20").replace(0, np.nan)
-    daily["IV_HV_RATIO_30"] = daily["ATM_IV"] / daily.get("HV_30").replace(0, np.nan)
+    hv_cols = [
+        "UNDERLYING_CLOSE",
+        "HV_10",
+        "HV_20",
+        "HV_30",
+        "HV_60",
+        "HV_90",
+        "HV_252",
+    ]
+
+    available_cols = [
+        "TRADE_DATE",
+        "SYMBOL",
+        *[c for c in hv_cols if c in option_rows.columns],
+    ]
+
+    hv_daily = (
+        option_rows[available_cols]
+        .drop_duplicates(["TRADE_DATE", "SYMBOL"])
+    )
+
+    daily = daily.merge(
+        hv_daily,
+        on=["TRADE_DATE", "SYMBOL"],
+        how="left",
+    )
+
+    # --------------------------------------------------
+    # IV - HV
+    # --------------------------------------------------
+
+    daily["IV_MINUS_HV_20"] = daily["ATM_IV"] - daily["HV_20"]
+
+    daily["IV_MINUS_HV_30"] = daily["ATM_IV"] - daily["HV_30"]
+
+    daily["IV_HV_RATIO_20"] = (
+        daily["ATM_IV"] /
+        daily["HV_20"].replace(0, np.nan)
+    )
+
+    daily["IV_HV_RATIO_30"] = (
+        daily["ATM_IV"] /
+        daily["HV_30"].replace(0, np.nan)
+    )
+
+    # --------------------------------------------------
+    # IV Percentile / IV Rank
+    # --------------------------------------------------
 
     for window in windows:
-        daily[f"IVP_{window}"] = rolling_percentile(daily["ATM_IV"], window)
-        daily[f"IVR_{window}"] = rolling_rank(daily["ATM_IV"], window)
+        daily[f"IVP_{window}"] = rolling_percentile(
+            daily["ATM_IV"],
+            window,
+        )
 
-    ratio_score = ((daily["IV_HV_RATIO_20"] - 0.70) / 1.60 * 100.0).clip(0, 100)
-    ivp_score = daily[f"IVP_{windows[0]}"] if windows else np.nan
-    ivr_score = daily[f"IVR_{windows[0]}"] if windows else np.nan
-    daily["FRV_SCORE"] = (0.45 * ratio_score + 0.35 * ivp_score + 0.20 * ivr_score).clip(0, 100)
+        daily[f"IVR_{window}"] = rolling_rank(
+            daily["ATM_IV"],
+            window,
+        )
+
+    # --------------------------------------------------
+    # FRV Score
+    # --------------------------------------------------
+
+    ratio_window = windows[0]
+
+    daily[f"IVHV_RATIO_PCTL_{ratio_window}"] = rolling_percentile(
+        daily["IV_HV_RATIO_20"],
+        ratio_window,
+    )
+
+    ratio_score = daily[f"IVHV_RATIO_PCTL_{ratio_window}"]
+    ivp_score = daily[f"IVP_{ratio_window}"]
+    ivr_score = daily[f"IVR_{ratio_window}"]
+
+    daily["FRV_SCORE"] = (
+        0.45 * ratio_score
+        + 0.35 * ivp_score
+        + 0.20 * ivr_score
+    ).clip(0, 100)
+
     daily["FRV_ZONE"] = pd.cut(
         daily["FRV_SCORE"],
         bins=[-np.inf, 25, 45, 60, 75, np.inf],
-        labels=["CHEAP", "FAIR_LOW", "FAIR", "RICH", "VERY_RICH"],
+        labels=[
+            "CHEAP",
+            "FAIR_LOW",
+            "FAIR",
+            "RICH",
+            "VERY_RICH",
+        ],
     )
 
     return daily
@@ -275,7 +402,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    symbols = [args.symbol.upper()] if args.symbol else discover_symbols(args.greeks_root, args.segment)
+
+    # Get symbols to process
+    if args.symbol:
+        symbols = [args.symbol.strip().upper()]
+    else:
+        symbols = discover_symbols(
+            args.greeks_root,
+            args.segment,
+        )
 
     print("OptionGreeks indicator build started")
     print(f"Greeks root : {args.greeks_root}")
@@ -289,7 +424,18 @@ def main() -> None:
     built = 0
     failed = 0
     jobs = max(1, args.jobs)
-    tasks = [(args.greeks_root, args.hv_root, args.output_root, args.segment, symbol, args.windows) for symbol in symbols]
+
+    tasks = [
+        (
+            args.greeks_root,
+            args.hv_root,
+            args.output_root,
+            args.segment,
+            symbol,
+            args.windows,
+        )
+        for symbol in symbols
+    ]
 
     if jobs == 1 or len(tasks) <= 1:
         for task in tasks:
@@ -303,7 +449,11 @@ def main() -> None:
                 print(f"[FAILED] {symbol}: {exc}")
     else:
         with ProcessPoolExecutor(max_workers=jobs) as executor:
-            futures = {executor.submit(build_symbol_worker, task): task[4] for task in tasks}
+            futures = {
+                executor.submit(build_symbol_worker, task): task[4]
+                for task in tasks
+            }
+
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
@@ -314,8 +464,9 @@ def main() -> None:
                     failed += 1
                     print(f"[FAILED] {symbol}: {exc}")
 
-    print("")
+    print()
     print(f"Completed. Built: {built}, Failed: {failed}")
+
     if failed:
         raise SystemExit(1)
 
